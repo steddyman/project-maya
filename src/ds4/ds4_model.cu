@@ -3828,6 +3828,13 @@ struct Model::Impl {
             }
             tp_uneven = std::strcmp(v, "1") == 0;
         }
+#if defined(STRATA_HIP_GFX906)
+        // gfx906 (two Vega 20 dies, a Radeon Pro Vega II Duo or a pair of MI50s): on unless the setting says 0.  Mac Pro 2019,
+        // IST-DAS 2.00 bpw GGUFs (n_ff 2304 = 9 blocks of 256), no drafter: decode 26.6 -> 27.9 tok/s, a 3,000-token prompt
+        // 108 -> 152 tok/s against each die its own layers
+        else
+            tp_uneven = true;
+#endif
         if (pk.gguf && tp > 1) {
             int blk = 32;
             for (const auto& kv : pk.t) {
