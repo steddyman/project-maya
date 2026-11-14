@@ -123,6 +123,12 @@ target_include_directories(strata_hip_runtime BEFORE INTERFACE
   "${STRATA_HIP_COMPAT_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 "${STRATA_HAS_WMMA_DEF}" "STRATA_HIP_ARCHS=\"${STRATA_HIP_ARCHS}\""
   $<$<BOOL:${STRATA_HIP_WAVE64}>:STRATA_HIP_WAVE64=1>)
+# A build for gfx906 alone (Vega 20: MI50 / MI60, Radeon VII, Radeon Pro Vega II) takes the kernels written for it
+# (STRATA_HIP_GFX906 in src/ds4): host and device code see the same macro, which __gfx906__ alone does not give.
+if(STRATA_HIP_ARCHS STREQUAL "gfx906")
+  target_compile_definitions(strata_hip_runtime INTERFACE STRATA_HIP_GFX906=1)
+  message(STATUS "Strata: gfx906-only HIP build - the gfx906 kernels are on (STRATA_HIP_GFX906)")
+endif()
 target_link_libraries(strata_hip_runtime INTERFACE hip::host)
 if(STRATA_HIP_FP_CONTRACT_ON)
   target_compile_options(strata_hip_runtime INTERFACE "$<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=on>")

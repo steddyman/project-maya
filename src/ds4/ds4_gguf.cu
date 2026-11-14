@@ -1331,6 +1331,12 @@ bool tc_ok() {
 #else
         int major = 0;
         ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major >= 7;
+#if defined(STRATA_HIP_GFX906)
+    if (nij == n && iq::g906_q5k_fuse_ok(IJ, nij)) {   // every job of the call: its GEMV kernel rounds the activations (no rounding launch)
+        for (int i = 0; i < nij; ++i) IJ[i].xf = jobs[i].xf;
+        QI.n = 0;
+    }
+#endif
 #endif
         k = ok ? 2 : 1;
         known[dev].store(k, std::memory_order_relaxed);

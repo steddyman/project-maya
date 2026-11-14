@@ -157,8 +157,12 @@ struct MvJob {
     size_t ycs = 0;
     const float* bias = nullptr;
     float alpha = 1.0f;
+    const float* xf = nullptr;   // (gfx906, g906_q5k_fuse_ok: the one column's F32 activations, rounded in the GEMV kernel - xq / xd unused)
 };
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// gfx906: every job a one-column Q5_K GEMV the lane-group kernel takes (the same k, a multiple of 1024) - it then rounds
+/// the activations itself (MvJob::xf), q8_quant's arithmetic to the bit, and the call needs no rounding launch.  false elsewhere.
+bool g906_q5k_fuse_ok(const MvJob* jobs, int n);
 
 /// (tests) every value of n rows of k (rows row_bytes(type, k) apart, on the device) as the kernels decode them: sub =
 /// the token / window / light kernels' codes times their scales (d s q - m; IQ1_M through the persistent kernels'
