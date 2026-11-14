@@ -25,6 +25,7 @@ Every page in this folder, by what you want to do. Back to the [README](../READM
 - [AMD_EXPERT_KERNELS.md](AMD_EXPERT_KERNELS.md): which RDNA decode expert kernel the HIP dispatcher picks for each architecture.
 - [AMD_UPSTREAM.md](AMD_UPSTREAM.md): an audit of the AMD backend changes shared with another project.
 - [MI50_VALIDATION.md](MI50_VALIDATION.md): the experimental AMD Instinct MI50 (`gfx906`) source build.
+- [MAC_PRO_2019.md](MAC_PRO_2019.md): DeepSeek-V4.1-Flash on a Mac Pro 2019's Radeon Pro Vega II Duo (`gfx906`): the kernels, the defaults and the numbers.
 - [METAL.md](METAL.md): the experimental Apple Silicon (Metal) build.
 - [PORT-MINIMAX-METAL.md](PORT-MINIMAX-METAL.md): notes on porting MiniMax-M3.1-Flash to Metal.
 - [DGX_SPARK.md](DGX_SPARK.md): Maya on an NVIDIA DGX Spark (GB10) and Grace, where memory is shared with the system.

@@ -1513,6 +1513,23 @@ against the host's sums on two GPUs and times them.
 | `MAYA_DS4_HIP_PEER_AR` | off (0) | a tensor-parallel pair's prompt-chunk all-reduces straight between the two GPUs' VRAM, exact (member 0's partial plus member 1's): HIP, and NVIDIA built with `DS4_CUDA_PEER_AR` (on; NVLink pairs ~1.3x faster long prompts on 8x RTX 3090). `auto` compares host, AR2 (when unset) and peer once at startup for eligible TP2 prompt groups; `0`/unset: the existing transport, no probing; `1` forces compatible P2P without timing. Requires bidirectional peer access and spare VRAM; explicit AR2 and flow groups retain their paths. `DS4_PEER_AR_TIMEOUT_S` (60) bounds a rank's wait for its partner. See [HIP_PEER_PREFILL.md](HIP_PEER_PREFILL.md) |
 | `DS4_PEER_AR_PROBE_MS` | 3000 | `MAYA_DS4_HIP_PEER_AR=auto`: each pair's startup measurement budget in ms, from after its setup; a probe that does not finish in time keeps the host transport |
 
+## DeepSeek on gfx906 (Vega 20)
+
+A HIP build for gfx906 alone (`-DCMAKE_HIP_ARCHITECTURES=gfx906`: Radeon Pro Vega II, Instinct MI50 / MI60, Radeon VII)
+has kernels of its own and other defaults for some of the settings above. They were measured on a Mac Pro 2019's Radeon
+Pro Vega II Duo; the numbers are in [MAC_PRO_2019.md](MAC_PRO_2019.md). Every other build is unchanged.
+
+| Variable | In a gfx906 build | What it does |
+| --- | --- | --- |
+| `DS4_G906_Q5K` | on | `0`: the Q5_K dense rows through the shared kernel, not the gfx906 one |
+| `DS4_G906_SET16` | on | `0`: a prompt's expert tiles in F32, not F16 |
+| `DS4_ANON_THP` | off | `1`: ask Linux for huge pages for the experts' copy in RAM, as other builds do |
+| `DS4_ATTN_SPLIT` | on (off elsewhere) | the split-KV attention for a decoded token and windows of up to 5 rows; `0`: off, `1`: on in any build |
+| `MAYA_DS4_TP_GGUF_UNEVEN` | on (off elsewhere) | `0`: each GPU its own layers where a GGUF's blocks do not split evenly |
+| `DS4_YOCO_TP` | on (off elsewhere) | `0`: a tensor-parallel group never skips layers on a long prompt |
+| `DS4_SETTLE_MS` | 0.5 ms a prompt token, 800 to 5,000 (off elsewhere) | the milliseconds the expert cache may take after a chunked prompt; `0`: off |
+| `DS4_CACHE_INFLIGHT` | 32 (8 elsewhere) | the expert-cache swaps under way at once |
+
 ## DeepSeek: helper memory in the Monitor
 
 With `MAYA_DS4_HELPER`, the Monitor shows the helper's allocated expert pool as **Helper experts**, separately
