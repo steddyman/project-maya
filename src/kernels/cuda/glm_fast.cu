@@ -2324,6 +2324,145 @@ __global__ void __launch_bounds__(WPB * 32) mv_rdna_kernel(const STRATA_GRID_CON
 }
 #endif
 
+#if defined(STRATA_HIP_GFX906)
+// ---- gfx906 (Vega 20) Q6_K GEMV, one activation: the lane-group kernel of steddyman/Strata's native_mmvq.cu
+// (g906_q6k_kernel) on this file's MvBatch.  LPR lanes a row, 256 / LPR rows at a time; a lane takes 64 weights of one
+// block - 16 consecutive values of each of the four 16-value runs of one 128-value half: ql[64n + l .. +16],
+// ql[64n + 32 + l .. +16], qh[32n + l .. +16], three 16-byte loads issued before their first use - and the job's
+// activation is staged in LDS once a block.  The group's sum by DPP lane moves (VALU, no LDS round trip).  The same
+// products as dot_q6_K, summed in another order: an output matches mv_kernel_t<14>'s to float rounding, not bitwise.
+// MAYA_G906_MV_Q6=0: mv_kernel_t<14>.
+typedef int g906_v4 __attribute__((ext_vector_type(4), aligned(2)));
+typedef int g906_v4a __attribute__((ext_vector_type(4), aligned(4)));
+template<int CTRL, int ROW_MASK>
+__device__ __forceinline__ float g906_dpp(float v) {
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), CTRL, ROW_MASK, 0xf, false));
+}
+// the sum of each LPR-lane group, in the group's last lane (LPR <= 16: in every lane of it)
+template<int LPR>
+__device__ __forceinline__ float g906_group_sum_dpp(float v) {
+    v += g906_dpp<0xb1, 0xf>(v);    // quad_perm [1,0,3,2]
+    v += g906_dpp<0x4e, 0xf>(v);    // quad_perm [2,3,0,1]: each quad's sum in its four lanes
+    if constexpr (LPR >= 8) v += g906_dpp<0x141, 0xf>(v);    // row_half_mirror: each 8 lanes' sum
+    if constexpr (LPR >= 16) v += g906_dpp<0x140, 0xf>(v);   // row_mirror: each row of 16's sum
+    if constexpr (LPR >= 32) v += g906_dpp<0x142, 0xa>(v);   // row_bcast15 into rows 1 and 3
+    if constexpr (LPR >= 64) v += g906_dpp<0x143, 0xc>(v);   // row_bcast31 into rows 2 and 3
+    return v;
+}
+template<int LPR>
+__global__ void __launch_bounds__(256) g906_mv_q6_kernel(const STRATA_GRID_CONSTANT MvBatch b, int rows_per_block) {
+    if (b.skip != nullptr && *b.skip) return;
+    extern __shared__ int g906_mv_xs[];
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const MvJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    {
+        const int nw = (J.n_in / 32) * (int) (sizeof(block_q8_1) / 4);
+        const int* src = (const int*) J.xq;
+        for (int i = threadIdx.x; i < nw; i += 256) g906_mv_xs[i] = src[i];
+    }
+    __syncthreads();
+    const block_q8_1* x = (const block_q8_1*) g906_mv_xs;
+    constexpr int GPB = 256 / LPR;
+    const int lane = (int) threadIdx.x % LPR, grp = (int) threadIdx.x / LPR;
+    const int bpr = J.n_in / 256;
+    const int row_beg = (bid - blk0) * rows_per_block;
+    const int row_end = min(J.n_out, row_beg + rows_per_block);
+    const block_q6_K* w = (const block_q6_K*) J.w;
+    for (int rb = row_beg; rb < row_end; rb += GPB) {
+        const int row = rb + grp;
+        const bool live = row < row_end;
+        float tmp = 0.0f;
+        for (int t = lane; live && t < 4 * bpr; t += LPR) {
+            const int kb = t >> 2, n = (t >> 1) & 1, l0 = (t & 1) * 16;
+            const block_q6_K* q = w + (size_t) row * bpr + kb;
+            const g906_v4 qa = *reinterpret_cast<const g906_v4*>(q->ql + 64 * n + l0);
+            const g906_v4 qb = *reinterpret_cast<const g906_v4*>(q->ql + 64 * n + 32 + l0);
+            const g906_v4 qh = *reinterpret_cast<const g906_v4*>(q->qh + 32 * n + l0);
+            int sc[4];
+#pragma unroll
+            for (int k = 0; k < 4; ++k) sc[k] = q->scales[8 * n + 2 * k + (t & 1)];
+            const float d = __half2float(__ushort_as_half(*reinterpret_cast<const unsigned short*>(&q->d)));
+            float sumf = 0.0f;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const block_q8_1* xb = x + kb * 8 + 4 * n + k;
+                const g906_v4a u = *reinterpret_cast<const g906_v4a*>(xb->qs + l0);
+                int sacc = 0;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int a = qa[i], c = qb[i], h = qh[i];
+                    const int v = k == 0 ? (a & 0x0f0f0f0f) | ((h << 4) & 0x30303030)
+                                : k == 1 ? (c & 0x0f0f0f0f) | ((h << 2) & 0x30303030)
+                                : k == 2 ? ((a >> 4) & 0x0f0f0f0f) | (h & 0x30303030)
+                                         : ((c >> 4) & 0x0f0f0f0f) | ((h >> 2) & 0x30303030);
+                    // q - 32 per byte without borrows: q < 64, so (q | 0x80) - 0x20 stays in a byte; ^ 0x80 signs it
+                    sacc = __dp4a(((v | (int) 0x80808080) - 0x20202020) ^ (int) 0x80808080, u[i], sacc);
+                }
+                sumf += __half2float(__ushort_as_half(*reinterpret_cast<const unsigned short*>(xb))) *
+                        (float) (sacc * sc[k]);
+            }
+            tmp += d * sumf;
+        }
+        const float v = g906_group_sum_dpp<LPR>(tmp);
+        if (live && lane == LPR - 1) J.y[row] = mv_out(J.alpha, v, J.bias ? J.bias[row] : 0.0f);
+    }
+}
+// lanes a row from the row's task count (4 a 256-value block): the widest group that divides the tasks and still
+// gives each lane >= 4 of them (4096 inputs: 16 lanes x 4)
+inline int g906_mv_lpr(int n_in) {
+    const int ntask = 4 * (n_in / 256);
+    for (int l : {64, 32, 16}) if (ntask % l == 0 && ntask / l >= 4) return l;
+    return 8;
+}
+// The batch's one-activation Q6_K jobs through g906_mv_q6_kernel (a launch per group width present); marks them done.
+// A job of fewer than MAYA_G906_MV_MIN_ROWS rows (default 256) keeps mv_kernel_t<14>.
+void g906_mv_q6(const MvJob* jobs, int n, bool* done, cudaStream_t s) {
+    static const bool on = [] { const char* v = std::getenv("MAYA_G906_MV_Q6"); return !(v && v[0] == '0'); }();
+    static const int min_rows = [] { const char* v = std::getenv("MAYA_G906_MV_MIN_ROWS"); return v ? std::atoi(v) : 256; }();
+    static const int rpb_env = [] { const char* v = std::getenv("MAYA_G906_MV_RPB"); return v ? std::atoi(v) : 0; }();
+    static const bool log = std::getenv("MAYA_G906_MV_LOG") != nullptr;
+    if (!on) return;
+    for (const int lpr : {8, 16, 32, 64}) {
+        int pick[kMaxMvJobs], m = 0, rows = 0, max_in = 0;
+        for (int i = 0; i < n; ++i) {
+            const MvJob& j = jobs[i];
+            if (done[i] || j.type != 14 || j.ncol != 1 || j.xq == nullptr || j.n_in % 256 != 0 || j.n_out < min_rows ||
+                g906_mv_lpr(j.n_in) != lpr)
+                continue;
+            pick[m++] = i;
+            rows += j.n_out;
+            max_in = std::max(max_in, j.n_in);
+        }
+        if (m == 0) continue;
+        const int gpb = 256 / lpr;
+        int rpb = rpb_env > 0 ? (rpb_env + gpb - 1) / gpb * gpb : gpb;
+        while (rpb_env <= 0 && rpb < 64 && (rows + 2 * rpb - 1) / (2 * rpb) >= 256) rpb *= 2;
+        MvBatch b{};
+        b.skip = g_skip;
+        int acc = 0;
+        for (int k = 0; k < m; ++k) {
+            b.j[k] = jobs[pick[k]];
+            acc += (jobs[pick[k]].n_out + rpb - 1) / rpb;
+            b.blk_end[k] = acc;
+            done[pick[k]] = true;
+            if (log) std::fprintf(stderr, "g906 mv q6: %d x %d, %d lanes a row, %d rows a block\n", jobs[pick[k]].n_out,
+                                  jobs[pick[k]].n_in, lpr, rpb);
+        }
+        b.n = m;
+        const size_t lds = (size_t) (max_in / 32) * sizeof(block_q8_1);
+        switch (lpr) {
+            case 8: g906_mv_q6_kernel<8><<<acc, 256, lds, s>>>(b, rpb); break;
+            case 16: g906_mv_q6_kernel<16><<<acc, 256, lds, s>>>(b, rpb); break;
+            case 32: g906_mv_q6_kernel<32><<<acc, 256, lds, s>>>(b, rpb); break;
+            default: g906_mv_q6_kernel<64><<<acc, 256, lds, s>>>(b, rpb); break;
+        }
+    }
+}
+#endif
+
 __global__ void quantize_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;   // n % 32 == 0: whole warps only
@@ -5687,6 +5826,9 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     // (one-column batches only: a verify window's several-column jobs go to the tiled kernels below)
     bool one_col = true;
     for (int i = 0; i < n; ++i) one_col = one_col && jobs[i].ncol == 1;
+#if defined(STRATA_HIP_GFX906)
+    if (typed && one_col) g906_mv_q6(jobs, n, done, s);   // (Q6_K, one activation: the lane-group kernel)
+#endif
     if (typed && one_col) {
         mv_rdna(jobs, n, 1, done, s);
     } else if (typed && mv_rdna_device()) {

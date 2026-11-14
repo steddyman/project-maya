@@ -1530,6 +1530,19 @@ Pro Vega II Duo; the numbers are in [MAC_PRO_2019.md](MAC_PRO_2019.md). Every ot
 | `DS4_SETTLE_MS` | 0.5 ms a prompt token, 800 to 5,000 (off elsewhere) | the milliseconds the expert cache may take after a chunked prompt; `0`: off |
 | `DS4_CACHE_INFLIGHT` | 32 (8 elsewhere) | the expert-cache swaps under way at once |
 
+## GLM-5.3-Flash on gfx906 (Vega 20)
+
+The same kind of build (`-DCMAKE_HIP_ARCHITECTURES=gfx906`) for the `maya` engine; numbers in
+[MAC_PRO_2019.md](MAC_PRO_2019.md#glm-53-flash-maya-m).
+
+| Variable | In a gfx906 build | What it does |
+| --- | --- | --- |
+| `MAYA_G906_MV_Q6` | on | `0`: one-activation Q6_K GEMVs through `mv_kernel_t`, not the gfx906 lane-group kernel |
+| `MAYA_G906_MV_MIN_ROWS` | 256 | a Q6_K GEMV of fewer rows keeps `mv_kernel_t` |
+| `MAYA_G906_MV_RPB` | by the launch's rows | rows a block of the gfx906 kernel |
+| `MAYA_G906_MV_LOG` | unset | set: a line for each GEMV the gfx906 kernel takes (its shape, lanes a row, rows a block) |
+| `MAYA_GLM_LINK_WAKE` | off (on elsewhere) | `1`: the 1.5 s wake-up spin kernel before the start-up PCIe link timing |
+
 ## DeepSeek: helper memory in the Monitor
 
 With `MAYA_DS4_HELPER`, the Monitor shows the helper's allocated expert pool as **Helper experts**, separately

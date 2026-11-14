@@ -3933,7 +3933,15 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     // the link is timed with the GPU awake (see glm_link_wake): 400 ms for the clocks and the link to ramp up, then
     // 1.1 s of the kernel left for both measurements below
     cudaStream_t wake = nullptr;
-    if (cudaStreamCreateWithFlags(&wake, cudaStreamNonBlocking) == cudaSuccess) {
+    // gfx906 (Vega 20, Mac Pro 2019): no wake-up spin unless MAYA_GLM_LINK_WAKE=1.  Its link does not idle down the
+    // way a consumer NVIDIA card's does, and a 1.5 s kernel that cannot be preempted holds up the desktop's own jobs
+    // on the die that drives the display; a start on 2026-11-14 ended in a job timeout and a failed GPU reset here
+#if defined(STRATA_HIP_GFX906)
+    static const bool link_wake = [] { const char* v = getenv("MAYA_GLM_LINK_WAKE"); return v && v[0] == '1'; }();
+#else
+    constexpr bool link_wake = true;
+#endif
+    if (link_wake && cudaStreamCreateWithFlags(&wake, cudaStreamNonBlocking) == cudaSuccess) {
         glm_link_wake<<<1, 1, 0, wake>>>(1500ull * 1000000ull);
         std::this_thread::sleep_for(std::chrono::milliseconds(400));
     }

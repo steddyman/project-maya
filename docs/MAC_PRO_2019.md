@@ -1,7 +1,7 @@
 # Mac Pro 2019 on Linux: Radeon Pro Vega II Duo (gfx906)
 
 This fork ([steddyman/project-maya](https://github.com/steddyman/project-maya)) adds kernels and defaults for Vega 20
-(`gfx906`) to the DeepSeek-V4.1-Flash engine (`maya-ds4`). They were written and measured on one machine:
+(`gfx906`) to the DeepSeek-V4.1-Flash engine (`maya-ds4`) and the GLM-5.3-Flash engine (`maya`). They were written and measured on one machine:
 
 | | |
 | --- | --- |
@@ -17,8 +17,8 @@ them. [MI50_VALIDATION.md](MI50_VALIDATION.md) is the upstream page for the MI50
 
 The kernels come from the same work on the Strata engine
 ([its Mac Pro page](https://github.com/steddyman/Strata/blob/main/docs/MAC_PRO_2019_LINUX.md)), which shares this
-engine's DeepSeek code. Only DeepSeek-V4.1-Flash is covered here. GLM-5.3-Flash, GLM-5.3 and MiniMax-M3.1-Flash build
-and are unchanged; they were not measured on this machine.
+engine's DeepSeek code. DeepSeek-V4.1-Flash is covered first, GLM-5.3-Flash (Maya-M) [below](#glm-53-flash-maya-m). GLM-5.3 and
+MiniMax-M3.1-Flash build and are unchanged; they were not measured on this machine.
 
 ## Before you start: let the GPUs clock up
 
@@ -90,9 +90,56 @@ of the time. Of a die's kernel time, 20 % is `ar_sum_kernel`, the wait for the o
 Not done:
 
 - The hyper-connection kernel of the Strata engine. It needs more of this engine's code changed than the pieces above.
-- GLM-5.3-Flash, GLM-5.3 and MiniMax-M3.1-Flash on this machine: no profile, no gfx906 kernels.
+- GLM-5.3 and MiniMax-M3.1-Flash on this machine: no profile, no gfx906 kernels.
 - A short prompt (a few hundred tokens) still copies every expert that is not in VRAM to the dies, used or not, so
   it reads far slower per token than a long one.
+
+## GLM-5.3-Flash (Maya-M)
+
+`maya` with the Maya-M GGUF set (116 GB: IQ2_S gate / up experts, IQ3_XXS / IQ3_S down, Q6_K dense weights), the layers
+split over the two dies (`--layer-split auto`: 24 and 21), the MTP block drafting, a 32K context, 14 November 2026.
+About half of the experts fit in VRAM (86 % of the routed ones); the rest sit in pinned RAM and are computed by the
+Xeon or pulled over PCIe as they are routed.
+
+| Test | Upstream v1.1.63 | This fork |
+| --- | ---: | ---: |
+| Decode, 256 tokens after a 22-token prompt (the engine alone) | 24.5, 25.3, 25.3 tok/s | **29.7 tok/s** |
+| The same 256 tokens forced (`--spec-follow`), 1 GB / 384 MB kept free | 27.4 tok/s | **29.4, 29.1 tok/s** |
+| Through the server: 300 tokens after a short prompt | 25.7, 28.3, 26.2 tok/s | **28.4, 33.0, 28.2 tok/s** |
+| Through the server: a 4,008-token prompt, then 200 tokens | 187 tok/s, 23.5 tok/s | 186 tok/s, **25.8 tok/s** |
+| Through the server: an 18,920-token prompt, then 200 tokens | 233 tok/s, 24.7 tok/s | 233 tok/s, **27.0 tok/s** |
+
+| Change | Measured | Switch |
+| --- | --- | --- |
+| A Q6_K dense kernel for gfx906 (`g906_mv_q6_kernel`, from the Strata engine): 8-64 lanes a row by the row's length, three 16-byte loads a lane issued first, the activation in LDS, the group's sum by DPP | decode 25.3 -> 27.0, 27.2 tok/s; the Q6_K kernels' share of a die's time 25.5 % -> 20 % | `MAYA_G906_MV_Q6=0` |
+| Less VRAM kept free: 1 GB on the die with the display, 384 MB on the other (the setup's default for AMD is 3 GB each; the desktop held under 0.1 GB here) | decode 27.1 -> 29.0 (1 GB each) -> 29.7 tok/s; the routed experts found in VRAM 83 % -> 86 % | `MAYA_GLM_RESERVE_MB`, `MAYA_GLM_RESERVE_LATER_MB` in the config's `env` |
+| No wake-up spin before the engine times its PCIe link at start (see below) | the timing reads the same (0.665 against 0.672 ms an expert) | `MAYA_GLM_LINK_WAKE=1` brings it back |
+
+Measured and left alone: upstream's tuned IQ2_S gate / up (`MAYA_GLM_GU22_TUNED=1`: 24.5 against 24.5 tok/s); the
+layer boundary at 22 or 20 instead of 24 (25.5, 26.2 against 27.1 tok/s).
+
+Where a die's time goes with the Q6_K kernel on (3 GB kept free): 30 % in `moe_fetch_kernel`, the pull of routed
+experts from RAM over PCIe (about 19 a token, 8.6 MB each); 12 % waiting for the experts the Xeon computes; 20 % the
+Q6_K kernels; 10.5 % the IQ2_S gate / up. The prompt path is bound by the same link: a 4,008-token prompt spent 9.5 of
+its 11.3 s copying 26 GB of experts to each die, so no kernel change moves it.
+
+Agreement: the engine has no logit dump on this path, so the check is `--spec-follow` with 256 tokens an upstream run
+wrote: the model's own pick differed from that text at 5 of 256 positions with the kernel off and at 8 and 4 of 256
+with it on (96 tokens: 2, 2 off; 1, 4 on). Two upstream runs of one prompt already differ from each other from the
+14th token on, since which experts the Xeon computes differs from run to run.
+
+### A GPU hang at start, and what was changed for it
+
+On 14 November 2026 a start of `maya` ended with both dies off the PCIe bus and the Mac powered off (it started again
+only after half an hour unplugged). The kernel log: a job of the desktop on the die that drives the display timed out
+after 10 s (`ring comp_1.3.0 timeout`), the driver's GPU reset failed with the engine attached, and both dies then
+reported `pci_channel_io_perm_failure`. The engine was in its start-up link timing: `glm_link_wake`, a 1.5 s spin
+kernel, beside 32 timed copies. No GEMV had been launched. Four earlier starts that day had passed the same step.
+
+What this fork and this machine do since: the spin is not launched on a gfx906 build; the kernel is booted with
+`amdgpu.gpu_recovery=0`, so a stalled job freezes the display until a reboot and the driver never attempts that
+reset; and the desktop application that owned the stalled job runs without GPU acceleration. Eighteen starts since
+have logged no GPU error. The cause of the first stall is not known.
 
 ## Quality check
 
