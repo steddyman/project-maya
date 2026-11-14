@@ -66,6 +66,11 @@ struct Finish {
     float* q8d = nullptr;
 };
 /// a packed FP4 row's bytes (Finish::pdst): len / 2 of codes, a scale byte a group (quant 2: 16 values, quant 3: 32)
+/// hc_mix_split, then hc_pre_norm(h, nmix, nw, hcdim / hc, hc, T, eps, nx) - nmix a mix written before this call, not
+/// this call's pre.  On gfx906 one launch (the norm a block of its own, hc_pre_norm_kernel's arithmetic to the bit).
+void hc_mix_split_norm(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, unsigned* cnt,
+                       const float* scale, const float* base, int hc, int iters, float hc_eps, float* pre, float* post,
+                       float* comb, const float* nmix, const float* nw, float* nx, cudaStream_t s);
 constexpr size_t fp4_row_bytes(int len, int quant) { return (size_t) len / 2 + (size_t) len / (quant == 2 ? 16 : 32); }
 void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cudaStream_t s);
 

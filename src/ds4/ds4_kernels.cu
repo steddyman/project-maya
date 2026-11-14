@@ -6,6 +6,8 @@
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
+#include "ds4_attn_split.cuh"
+#include <map>
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
@@ -2945,7 +2947,33 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     }
     __syncthreads();
     const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
-    for (int r = 0; r < k; ++r) {
+#if defined(STRATA_HIP_GFX906)
+    // gfx906: the k picks in one pass - a score's rank is the number of scores above it (an equal one at a lower index
+    // counts), and rank r < k is pick r: the rounds' picks in the rounds' order, without their 2 k barriers.  A score the
+    // rounds would never take (not above -FLT_MAX: a non-finite gate input) sends the block through the rounds below,
+    // so that case stays theirs.
+    __shared__ int odd;
+    if (threadIdx.x == 0) odd = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = bs[i];
+        if (!(v > -FLT_MAX)) {
+            odd = 1;
+            continue;
+        }
+        int rank = 0;
+        for (int jj = 0; jj < n; ++jj) {
+            const float u = bs[jj];
+            rank += (u > v || (u == v && jj < i)) ? 1 : 0;
+        }
+        if (rank < k) pick[rank] = i;
+    }
+    __syncthreads();
+    const bool rounds = odd != 0;
+#else
+    const bool rounds = true;
+#endif
+    for (int r = 0; rounds && r < k; ++r) {
         float best = -FLT_MAX;
         int bix = 0x7fffffff;
         for (int i = threadIdx.x; i < n; i += blockDim.x)
@@ -4641,6 +4669,44 @@ static bool attn_mma_now() {
 #endif
 }
 
+// ---- the split-KV decode attention (ds4_attn_split.cuh, from the Strata engine): its scratch, a device allocation a
+// (device, stream), made on first use and kept.  DS4_ATTN_SPLIT=1 turns it on, 0 off; on by default in a gfx906 build
+// (two Vega 20 dies, 32 heads a die: in Strata's engine the decode's attention after a 13.9K-token prompt 31.9 -> 26.7 ms
+// a token over both dies).  The same inputs as the kernels below; the merge sums the chunks in another order, so the
+// bits differ in the last place.
+constexpr int kSplitG = 4, kSplitR = 40, kSplitCap = 24, kSplitMaxT = 5;
+static bool split_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("DS4_ATTN_SPLIT");
+#if defined(STRATA_HIP_GFX906)
+        if (e == nullptr) return true;
+#endif
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
+static attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
+    static std::mutex mu;
+    static std::map<std::pair<int, cudaStream_t>, attnsplit::AttnSplitScratch> m;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    std::lock_guard<std::mutex> lk(mu);
+    auto it = m.find({dev, s});
+    if (it != m.end()) return it->second;
+    attnsplit::AttnSplitScratch sc;
+    sc.nsplit = kSplitCap;
+    sc.max_t = kSplitMaxT;
+    const size_t np = (size_t) kSplitMaxT * heads * kSplitCap;
+    if (cudaMalloc((void**) &sc.part, np * 512 * sizeof(float)) != cudaSuccess ||
+        cudaMalloc((void**) &sc.ml, np * 2 * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        if (sc.part != nullptr) cudaFree(sc.part);
+        sc = attnsplit::AttnSplitScratch{};
+    }
+    m[{dev, s}] = sc;
+    return sc;
+}
+
 // the few-queries path's scratch takes T queries of sel_stride rows
 static bool attn_scr_fits(int T, int sel_stride, const AttnScratch* scr) {
     return scr != nullptr && scr->rows != nullptr && T <= scr->max_t && sel_stride <= scr->cap;
@@ -4687,6 +4753,19 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
         }
 #endif
         heads_per_block = 0;
+    }
+    // a decode step / short verify window of packed rows: the split-KV kernel (split_enabled)
+    if (a.gen == 0 && T >= 1 && T <= kSplitMaxT && heads % kSplitG == 0 && heads_per_block <= 0 && split_enabled()) {
+        int total_max = 0;
+        for (int t = 0; t < T; ++t) total_max = std::max(total_max, a.nwin[t] + a.nsel[t]);
+        if (total_max > 0 && total_max <= kSplitCap * kSplitR) {
+            const attnsplit::AttnSplitScratch sc = split_scratch(s, heads);
+            if (sc.part != nullptr) {
+                attnsplit::sparse_attn_split<kSplitG, kSplitR>(q, win, (const uint8_t*) ckv, kv_row_bytes(kKvFp4, d), sel,
+                                                               sel_stride, a, sink, heads, T, scale, out, sc, total_max, s);
+                return;
+            }
+        }
     }
     // a few queries (a decode step, a short window): their selected rows decoded once a query into the scratch, then
     // the BF16 rows' kernel itself (heads_per_block -1: this way at any T)
