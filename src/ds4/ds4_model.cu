@@ -1784,7 +1784,15 @@ struct Model::Impl {
     static float env_f(const char* k, float d) { return std::getenv(k) ? (float) std::atof(std::getenv(k)) : d; }
     const float c_margin = env_f("DS4_CACHE_MARGIN", 1.25f), c_bonus = env_f("DS4_CACHE_BONUS", 1.0f),
                 c_decay = env_f("DS4_CACHE_DECAY", 0.9f);
-    const int c_inflight = std::max(1, (int) env_f("DS4_CACHE_INFLIGHT", (float) kMaxSwaps));
+    // gfx906 (two Vega 20 dies, ~40 % of the experts in VRAM, the rest on the CPU lane): 32 swaps under way, and a settle
+    // after a chunked prompt that grows with it (cache_settle).  Mac Pro 2019, IST-DAS 2.00 bpw, a 14,000-token prompt then
+    // 64 tokens: decode 20.7 -> 30.4 tok/s (the CPU lane 5.1 % of the picks), the prompt 44.5 -> 48.3 s with a 3 s settle
+#if defined(STRATA_HIP_GFX906)
+    static constexpr int kInflightDefault = 32;
+#else
+    static constexpr int kInflightDefault = kMaxSwaps;
+#endif
+    const int c_inflight = std::max(1, (int) env_f("DS4_CACHE_INFLIGHT", (float) kInflightDefault));
     // the RAM tier (a GGUF's in-place experts, as GLM's: the hottest in VRAM, the next hottest here, the coldest in the
     // files): RAM slots of one expert blob each, filled at load with the hottest experts VRAM does not hold, so the
     // CPU lane reads them from RAM; between windows (cache_tick) a hotter expert from the files takes the place of the
@@ -12564,11 +12572,16 @@ struct Model::Impl {
     static double settle_ms() {
         static const double ms = [] {
             const char* v = ds4_env("DS4_SETTLE_MS");
+#if defined(STRATA_HIP_GFX906)
+            // (unset on gfx906: -1, a budget from the prompt's length - cache_settle; 0 still turns it off)
+            return v != nullptr ? std::max(0.0, std::atof(v)) : -1.0;
+#else
             return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
+#endif
         }();
         return ms;
     }
-    bool settle_on() const { return settle_ms() > 0.0 && o.expert_cache && !cache_ths.empty(); }
+    bool settle_on() const { return settle_ms() != 0.0 && o.expert_cache && !cache_ths.empty(); }
     std::vector<uint32_t> prof_run0;   // (the profile before the run)
     void settle_learn() {
         if (prof_run0.size() != prof.size()) return;
@@ -12583,11 +12596,14 @@ struct Model::Impl {
             }
         }
     }
-    void cache_settle() {
+    // took: the tokens the prompt read.  gfx906 with DS4_SETTLE_MS unset: 0.5 ms a token (about 7 % of a prompt's time at
+    // ~150 tok/s), 800 ms at least and 5,000 ms at most - there the CPU lane is what a decoded token waits for
+    void cache_settle(int took = 0) {
         const double t0 = now_ms();
         const int64_t s0 = st.swaps;
         int rounds = 0;
-        while (now_ms() - t0 < settle_ms()) {
+        const double budget = settle_ms() >= 0.0 ? settle_ms() : std::min(5000.0, std::max(800.0, 0.5 * (double) took));
+        while (now_ms() - t0 < budget) {
             tick_begin();
             cache_switch();
             for (Layer& l : L) {   // (every hot CPU-lane expert a hit: cache_queue takes the hottest a layer)
@@ -12605,7 +12621,7 @@ struct Model::Impl {
         if (o.verbose)
             std::fprintf(stderr, "ds4: expert cache after the prompt: %lld moves into VRAM in %.0f ms (%d rounds, "
                                  "DS4_SETTLE_MS=%.0f)\n",
-                         (long long) (st.swaps - s0), now_ms() - t0, rounds, settle_ms());
+                         (long long) (st.swaps - s0), now_ms() - t0, rounds, budget);
     }
 
     // lookahead's thread: the ranges the CPU lane asked for, read in (os::prefetch) off the lane, which computes
@@ -20449,6 +20465,11 @@ struct Model::Impl {
     static bool yoco_tp() {
         static const bool on = [] {
             const char* e = ds4_env("DS4_YOCO_TP");
+#if defined(STRATA_HIP_GFX906)
+            // on by default on gfx906 (two Vega 20 dies, one group): Mac Pro 2019, IST-DAS 2.00 bpw, a 14,000-token
+            // prompt 221 -> 236 tok/s; 0 turns it off
+            if (e == nullptr) return true;
+#endif
             return e != nullptr && std::atoi(e) != 0;
         }();
         return on;
@@ -21164,7 +21185,7 @@ struct Model::Impl {
         //  taps, as one call's; a part before the skip's cut never reaches the layers they are taken at - and settles
         //  the cache once, after the whole prompt)
         if (run_end) {
-            if (settle) cache_settle();
+            if (settle) cache_settle(took);
             warm_after(took);
         }
         // the drafter seeded from the run's last rows - when they went through every layer: not after a yield, nor a
