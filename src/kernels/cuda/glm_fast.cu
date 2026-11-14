@@ -2331,7 +2331,7 @@ __global__ void __launch_bounds__(WPB * 32) mv_rdna_kernel(const STRATA_GRID_CON
 // ql[64n + 32 + l .. +16], qh[32n + l .. +16], three 16-byte loads issued before their first use - and the job's
 // activation is staged in LDS once a block.  The group's sum by DPP lane moves (VALU, no LDS round trip).  The same
 // products as dot_q6_K, summed in another order: an output matches mv_kernel_t<14>'s to float rounding, not bitwise.
-// Opt-in (MAYA_G906_MV_Q6=1); otherwise mv_kernel_t<14>.
+// MAYA_G906_MV_Q6=0: mv_kernel_t<14>.
 typedef int g906_v4 __attribute__((ext_vector_type(4), aligned(2)));
 typedef int g906_v4a __attribute__((ext_vector_type(4), aligned(4)));
 template<int CTRL, int ROW_MASK>
@@ -2420,9 +2420,7 @@ inline int g906_mv_lpr(int n_in) {
 // The batch's one-activation Q6_K jobs through g906_mv_q6_kernel (a launch per group width present); marks them done.
 // A job of fewer than MAYA_G906_MV_MIN_ROWS rows (default 256) keeps mv_kernel_t<14>.
 void g906_mv_q6(const MvJob* jobs, int n, bool* done, cudaStream_t s) {
-    // OFF unless MAYA_G906_MV_Q6=1: not run yet (the first start with it, 2026-11-14, stopped in the engine's start-up
-    // before any GEMV was launched, when the GPUs hung in a driver reset)
-    static const bool on = [] { const char* v = std::getenv("MAYA_G906_MV_Q6"); return v && v[0] == '1'; }();
+    static const bool on = [] { const char* v = std::getenv("MAYA_G906_MV_Q6"); return !(v && v[0] == '0'); }();
     static const int min_rows = [] { const char* v = std::getenv("MAYA_G906_MV_MIN_ROWS"); return v ? std::atoi(v) : 256; }();
     static const int rpb_env = [] { const char* v = std::getenv("MAYA_G906_MV_RPB"); return v ? std::atoi(v) : 0; }();
     static const bool log = std::getenv("MAYA_G906_MV_LOG") != nullptr;
